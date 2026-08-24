@@ -1,7 +1,7 @@
 """峰谷模型切换插件 — 任务模型列表 HTML 报表渲染（不依赖 MaiBot SDK，便于离线测试）。
 
-生成参考样式：浅灰背景 + 白色圆角卡片 + 深绿强调色（对应 36116a27f2c579fc3a85d297e5ba5495.png 的报表风格）。
 数据来自 model_config.toml 的 [model_task_config]（动态调整 8 任务 + 固定 3 任务）。
+任务清单统一定义于 switcher_core，此处仅负责渲染。
 """
 
 from __future__ import annotations
@@ -10,24 +10,10 @@ import html
 from datetime import datetime
 from typing import Any, Dict, List, Sequence, Tuple
 
-# 动态调整任务（峰谷切换插件管理）：(配置键, 中文名)
-DYNAMIC_TASKS: Tuple[Tuple[str, str], ...] = (
-    ("replyer", "回复"),
-    ("planner", "规划"),
-    ("memory", "记忆"),
-    ("mid_memory", "聊天回想"),
-    ("utils", "工具"),
-    ("learner", "学习"),
-    ("expression_use", "表达方式使用"),
-    ("emoji", "表情包"),
-)
+from .switcher_core import FIXED_TASKS, TASKS
 
-# 固定任务（不参与动态调整）
-FIXED_TASKS: Tuple[Tuple[str, str], ...] = (
-    ("vlm", "视觉"),
-    ("voice", "语音"),
-    ("embedding", "嵌入"),
-)
+# 动态调整任务（峰谷切换插件管理）与固定任务均来自 switcher_core
+DYNAMIC_TASKS: Tuple[Tuple[str, str], ...] = TASKS
 
 
 def build_report_html(doc: Any, now: datetime | None = None) -> str:
