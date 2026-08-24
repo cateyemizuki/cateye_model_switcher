@@ -28,17 +28,28 @@ import tomlkit
 # 北京时间
 TZ = timezone(timedelta(hours=8))
 
-# 参与动态调整的任务键（需求限定；vlm / voice / embedding 保持不变）
-TASK_KEYS: Tuple[str, ...] = (
-    "replyer",
-    "planner",
-    "memory",
-    "mid_memory",
-    "utils",
-    "learner",
-    "expression_use",
-    "emoji",
+# 参与动态调整的任务（vlm / voice / embedding 保持不变）：
+# (model_task_config 键, 中文名)，供切换逻辑与报表渲染共用。
+TASKS: Tuple[Tuple[str, str], ...] = (
+    ("replyer", "回复"),
+    ("planner", "规划"),
+    ("memory", "记忆"),
+    ("mid_memory", "聊天回想"),
+    ("utils", "工具"),
+    ("learner", "学习"),
+    ("expression_use", "表达方式使用"),
+    ("emoji", "表情包"),
 )
+
+# 不参与动态调整的固定任务（仅报表展示用）
+FIXED_TASKS: Tuple[Tuple[str, str], ...] = (
+    ("vlm", "视觉"),
+    ("voice", "语音"),
+    ("embedding", "嵌入"),
+)
+
+# 任务键（供旧测试/兼容引用）
+TASK_KEYS: Tuple[str, ...] = tuple(k for k, _ in TASKS)
 
 # 匹配 "HH:MM"
 _TIME_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*$")
