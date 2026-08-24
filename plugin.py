@@ -1,15 +1,15 @@
-"""峰谷模型切换插件 — MaiBot v2 插件入口。
+"""峰谷模型切换插件 — MaiBot 插件入口。
 
-功能：
-- 根据北京时间（UTC+8）峰谷时段，定时调整 MaiBot `model_config.toml` 中
-  replyer / planner / memory / mid_memory / utils / learner / expression_use / emoji
-  任务的 model_list 顺序，把当前时段指定的模型提升到列表首位（优先使用），
-  从而在不重启服务的前提下平衡模型成本与性能。
-- 启动时立即检查一次并应用；之后每 60 秒检查一次，时段变化（峰↔谷）才触发写文件。
-- vlm / voice / embedding 任务不受影响。
-- 修改使用 tomlkit 解析并原地写回，保留注释与空行、保持行尾风格、保持 inode
-  （避免 MaiBot FileWatcher 因替换文件而丢失监听）。
-- 容错：model_config.toml 或插件配置格式错误时捕获异常并记录日志，不使主程序崩溃。
+按北京时间（UTC+8）峰谷时段，定时调整 MaiBot ``model_config.toml`` 中
+replyer / planner / memory / mid_memory / utils / learner / expression_use / emoji
+任务的 ``model_list`` 顺序：把当前时段指定的模型提升到首位（优先使用），
+在不重启服务的前提下平衡模型成本与性能。vlm / voice / embedding 任务不受影响。
+
+关键设计：
+- 每 60 秒检查一次时段，仅峰↔谷变化（或启动/配置热重载时）才写文件；
+- 用 tomlkit 原地写回，保留注释、空行、行尾风格与 inode（避免 FileWatcher 丢失监听）；
+- 字节级对比 + 自己写入回执识别，避免「写文件 → 热重载 → 再写」死循环刷屏；
+- 全程容错，配置文件缺失/损坏时仅记录日志，不影响主程序。
 """
 
 from __future__ import annotations
@@ -21,19 +21,20 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, Iterable, Optional
 
 from maibot_sdk import (
-    Command,
     CONFIG_RELOAD_SCOPE_SELF,
+    Command,
     Field,
     MaiBotPlugin,
     ON_MODEL_CONFIG_RELOAD,
     PluginConfigBase,
 )
+from pydantic import create_model
 
 from .report_renderer import build_report_html
 from .switcher_core import (
+    TASKS,
     TZ,
     Schedule,
-    TASK_KEYS,
     apply_phase_to_doc,
     backup_file,
     build_schedule,
@@ -43,21 +44,26 @@ from .switcher_core import (
 
 # ==================== 常量 ====================
 
-# 配置版本（config_version）：与 _manifest.json 的 version 保持同步。
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+# 配置版本：与 _manifest.json 的 version 保持同步。
+# 1.0.0 → 1.1.0：新增 llmlist_admin_only 开关与 /switcher debug 命令。
+# 1.1.0 → 1.1.1：/switcher debug 新增静默窗口（debug_pause_minutes，自动检测安全网暂停）。
+# 旧版本配置文件在加载时自动补齐新字段，无需手动迁移。
+SUPPORTED_CONFIG_VERSION = "1.1.1"
 
-# 数据目录子文件夹名（data/plugins/cateye_model_switcher）。
-DATA_DIR_NAME = "cateye_model_switcher"
-
-# 插件默认模型配置文件路径：<MaiBot根目录>/config/model_config.toml
-# 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/，故相对路径为 ../../config/model_config.toml
+# 默认 model_config.toml 路径：<MaiBot根目录>/config/model_config.toml
+# 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/
 DEFAULT_MODEL_CONFIG_PATH = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "model_config.toml")
 )
 
+# 默认 bot_config.toml 路径：<MaiBot根目录>/config/bot_config.toml
+DEFAULT_BOT_CONFIG_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "bot_config.toml")
+)
+
 # 默认峰时时段（北京时间）：周一至周五 09:00-12:00、14:00-18:00
 DEFAULT_PEAK_PERIODS = ["09:00-12:00", "14:00-18:00"]
-# 默认排除星期：周六（6）、周日（7）
+# 默认排除峰时的星期：周六（6）、周日（7）
 DEFAULT_EXCLUDE_WEEKDAYS = [6, 7]
 
 # 检查周期（秒）
@@ -86,82 +92,38 @@ class ScheduleSectionConfig(PluginConfigBase):
     )
 
 
-class TaskMappingSectionConfig(PluginConfigBase):
-    """任务模型映射（每个任务的峰/谷模型为独立标量配置项）。
+def _build_task_mapping_config() -> type[PluginConfigBase]:
+    """动态生成「任务模型映射」配置类。
 
-    注意：MaiBot WebUI 配置表单不支持嵌套 PluginConfigBase 对象（会显示 [object Object]），
-    因此这里使用平铺的标量字段：<task>_peak_model / <task>_offpeak_model，
-    每个字段在 WebUI 中都是独立的文本输入框。
+    每个任务使用两个平铺标量字段 ``<task>_peak_model`` / ``<task>_offpeak_model``
+    （WebUI 配置表单不支持嵌套 PluginConfigBase 对象，故用平铺字段）。
+    用 create_model 生成以避免手写 16 个重复字段定义；
+    WebUI 元数据（__ui_*）在类创建后以类属性方式设置，避免被当作字段。
     """
+    fields: Dict[str, Any] = {}
+    for task, label in TASKS:
+        fields[f"{task}_peak_model"] = (
+            str,
+            Field(
+                default="",
+                description=f"{label}任务：峰时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
+            ),
+        )
+        fields[f"{task}_offpeak_model"] = (
+            str,
+            Field(
+                default="",
+                description=f"{label}任务：谷时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
+            ),
+        )
+    cls = create_model("TaskMappingConfig", __base__=PluginConfigBase, **fields)
+    cls.__ui_label__ = "任务模型映射"
+    cls.__ui_icon__ = "swap_horiz"
+    cls.__ui_order__ = 1
+    return cls
 
-    __ui_label__ = "任务模型映射"
-    __ui_icon__ = "swap_horiz"
-    __ui_order__ = 1
 
-    replyer_peak_model: str = Field(
-        default="",
-        description="回复任务：峰时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
-    )
-    replyer_offpeak_model: str = Field(
-        default="",
-        description="回复任务：谷时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
-    )
-    planner_peak_model: str = Field(
-        default="",
-        description="规划任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    planner_offpeak_model: str = Field(
-        default="",
-        description="规划任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    memory_peak_model: str = Field(
-        default="",
-        description="记忆任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    memory_offpeak_model: str = Field(
-        default="",
-        description="记忆任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    mid_memory_peak_model: str = Field(
-        default="",
-        description="聊天回想任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    mid_memory_offpeak_model: str = Field(
-        default="",
-        description="聊天回想任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    utils_peak_model: str = Field(
-        default="",
-        description="工具任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    utils_offpeak_model: str = Field(
-        default="",
-        description="工具任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    learner_peak_model: str = Field(
-        default="",
-        description="学习任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    learner_offpeak_model: str = Field(
-        default="",
-        description="学习任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    expression_use_peak_model: str = Field(
-        default="",
-        description="表达方式使用任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    expression_use_offpeak_model: str = Field(
-        default="",
-        description="表达方式使用任务：谷时使用的模型名（留空则跳过该任务）",
-    )
-    emoji_peak_model: str = Field(
-        default="",
-        description="表情包任务：峰时使用的模型名（留空则跳过该任务）",
-    )
-    emoji_offpeak_model: str = Field(
-        default="",
-        description="表情包任务：谷时使用的模型名（留空则跳过该任务）",
-    )
+TaskMappingSectionConfig = _build_task_mapping_config()
 
 
 class ModelFileSectionConfig(PluginConfigBase):
@@ -189,6 +151,18 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
+    admin_users: list[str] = Field(
+        default_factory=list,
+        description="管理员列表（格式：用户ID 或 平台:用户ID，如 \"123456789\" 或 \"qq:123456789\"；留空则无管理员）",
+    )
+    llmlist_admin_only: bool = Field(
+        default=False,
+        description="是否限制 /llmlist 命令仅管理员可用（默认关，所有人可用）",
+    )
+    debug_pause_minutes: int = Field(
+        default=5,
+        description="调用 /switcher debug 后暂停自动检测（安全网）的分钟数（默认 5；静默期间再次 debug 会重新计时，不叠加）",
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步，用于检查配置文件是否需要更新）",
@@ -214,11 +188,10 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
     """峰谷模型切换插件。"""
 
     config_model = CateyeModelSwitcherConfig
-    config_reload_subscriptions: ClassVar[Iterable[str]] = ("model",)
+    config_reload_subscriptions: ClassVar[Iterable[str]] = (ON_MODEL_CONFIG_RELOAD,)
 
     def __init__(self) -> None:
         super().__init__()
-        self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self._schedule: Schedule = Schedule()
         self._schedule_bad: list[str] = []
         self._task_models: Dict[str, Dict[str, str]] = {}
@@ -226,64 +199,54 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
         self._last_written_phase: Optional[str] = None  # 自己最近一次写入的时段
         self._last_written_at: Optional[float] = None  # 自己最近一次写入的时间戳
         self._scheduler_task: Optional[asyncio.Task] = None
+        # debug 静默窗口：调用 /switcher debug 后在此时间戳之前暂停自动检测（安全网）
+        self._debug_pause_until: Optional[float] = None
 
     # ==================== 配置读取 ====================
 
     def _get_model_config_path(self) -> str:
         path = str(self.config.model_file.model_config_path or "").strip()
-        if not path:
-            path = DEFAULT_MODEL_CONFIG_PATH
-        return os.path.normpath(path)
+        return os.path.normpath(path) if path else DEFAULT_MODEL_CONFIG_PATH
 
     def _get_data_dir(self) -> str:
-        plugins_root = os.path.dirname(str(self.ctx.paths.data_dir))  # .../data/plugins
-        return os.path.join(plugins_root, DATA_DIR_NAME)
+        # ctx.paths.data_dir = data/plugins/<plugin_id>；备份统一放其 backup 子目录
+        return os.path.join(str(self.ctx.paths.data_dir), "backup")
 
     def _load_task_models(self) -> Dict[str, Dict[str, str]]:
         """把配置 [task_mapping] 转为 {task: {"peak": ..., "offpeak": ...}}。
 
-        兼容三种形态：
-        - 新版平铺：task_mapping.<task>_peak_model / <task>_offpeak_model（WebUI 独立配置项）；
-        - 旧版嵌套：task_mapping.<task> 为含 peak_model/offpeak_model 属性的对象；
-        - 旧版 dict/字符串：{"peak": ..., "offpeak": ...} 或单字符串（峰谷同模型）。
+        只读取平铺字段 <task>_peak_model / <task>_offpeak_model（配置模型的唯一形态）。
         """
         mapping = self.config.task_mapping
         result: Dict[str, Dict[str, str]] = {}
-        for task in TASK_KEYS:
-            entry: Dict[str, str] = {}
-            # 新版：平铺标量字段 <task>_peak_model / <task>_offpeak_model
-            has_peak = hasattr(mapping, f"{task}_peak_model")
-            has_offpeak = hasattr(mapping, f"{task}_offpeak_model")
-            if has_peak or has_offpeak:
-                peak = getattr(mapping, f"{task}_peak_model", None)
-                offpeak = getattr(mapping, f"{task}_offpeak_model", None)
-                entry["peak"] = str(peak or "").strip()
-                entry["offpeak"] = str(offpeak or "").strip()
-                # 峰谷均留空 → 空映射（该任务静默跳过）
-                if not entry["peak"] and not entry["offpeak"]:
-                    entry = {}
+        for task, _ in TASKS:
+            peak = str(getattr(mapping, f"{task}_peak_model", "") or "").strip()
+            offpeak = str(getattr(mapping, f"{task}_offpeak_model", "") or "").strip()
+            if peak or offpeak:
+                result[task] = {"peak": peak, "offpeak": offpeak}
             else:
-                # 旧版：嵌套对象
-                raw = getattr(mapping, task, None)
-                peak2 = getattr(raw, "peak_model", None)
-                offpeak2 = getattr(raw, "offpeak_model", None)
-                if peak2 is not None or offpeak2 is not None:
-                    entry["peak"] = str(peak2 or "").strip()
-                    entry["offpeak"] = str(offpeak2 or "").strip()
-                    if not entry["peak"] and not entry["offpeak"]:
-                        entry = {}
-                elif isinstance(raw, dict):
-                    for key in ("peak", "offpeak"):
-                        val = raw.get(key)
-                        if isinstance(val, str):
-                            entry[key] = val.strip()
-                        elif val is not None:
-                            entry[key] = str(val).strip()
-                elif isinstance(raw, str) and raw.strip():
-                    val = raw.strip()
-                    entry = {"peak": val, "offpeak": val}
-            result[task] = entry
+                result[task] = {}  # 峰谷均留空 → 空映射（该任务静默跳过）
         return result
+
+    # ==================== 权限校验 ====================
+
+    def _is_admin(self, user_id: str) -> bool:
+        """判断 user_id 是否为插件配置的管理员。
+
+        配置格式支持两种：
+        - 纯用户 ID：如 "123456789"；
+        - 平台前缀：如 "qq:123456789"（此时也校验纯 ID 匹配）。
+        """
+        uid = str(user_id or "").strip()
+        if not uid:
+            return False
+        admins = [str(x).strip() for x in (self.config.plugin.admin_users or []) if str(x).strip()]
+        if not admins:
+            return False
+        if uid in admins:
+            return True
+        # 兼容 "平台:ID" 形式：仅比较 ID 部分
+        return any(uid == a.split(":", 1)[-1] for a in admins if ":" in a)
 
     # ==================== 时段切换 ====================
 
@@ -299,27 +262,36 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
         for msg in bad:
             self.ctx.logger.warning("峰谷时段配置无效：%s", msg)
 
-    def _get_current_phase(self, dt=None) -> str:
+    def _get_current_phase(self, dt: datetime | None = None) -> str:
         """返回当前时段："peak" / "offpeak"。"""
         now = dt or datetime.now(TZ)
         return "peak" if self._schedule.is_peak(now) else "offpeak"
 
-    def _describe_phase(self, phase: str) -> str:
+    @staticmethod
+    def _describe_phase(phase: str) -> str:
         return "峰时" if phase == "peak" else "谷时"
 
     # ==================== 核心执行 ====================
 
-    async def _check_and_apply(self, force: bool = False) -> bool:
+    async def _check_and_apply(self, force: bool = False, phase_override: Optional[str] = None) -> bool:
         """检查当前时段；若时段发生变化（或 force）则应用切换。全程容错。
+
+        参数：
+        - force：忽略时段缓存，强制重新评估并应用；
+        - phase_override：强制使用指定时段（"peak"/"offpeak"），用于 /switcher debug 测试，
+          不走时间判断，直接应用该时段对应的模型（会同步更新内部缓存）。
 
         返回是否实际写入了 model_config.toml（True 表示发生了文件修改，
         可能触发 MaiBot 热重载）。
         """
-        try:
-            phase = self._get_current_phase()
-        except Exception as e:
-            self.ctx.logger.error("判断当前时段失败：%s", e)
-            return False
+        if phase_override is not None:
+            phase = phase_override
+        else:
+            try:
+                phase = self._get_current_phase()
+            except Exception as e:
+                self.ctx.logger.error("判断当前时段失败：%s", e)
+                return False
         if not force and phase == self._current_phase:
             return False
 
@@ -350,8 +322,7 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
             self.ctx.logger.warning(msg)
 
         if result.changed == 0:
-            # 无实际变更：仅更新状态，不写文件（也避免无谓触发热重载）。
-            # 不打印 info（避免每次外部热重载后刷屏），仅 debug 级记录。
+            # 无实际变更：仅更新状态，不写文件（避免无谓触发热重载）。
             self.ctx.logger.debug(
                 "当前为%s，无任务需要调整（或指定模型均已就位/缺失），不修改 model_config.toml",
                 self._describe_phase(phase),
@@ -366,13 +337,11 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
 
         # 修改前备份（可选）
         if self.config.model_file.backup:
-            data_dir = self._get_data_dir()
-            backup_dir = os.path.join(data_dir, "backup")
-            try:
-                os.makedirs(backup_dir, exist_ok=True)
-            except Exception as e:
-                self.ctx.logger.warning("创建备份目录失败：%s", e)
-            backup_path = backup_file(model_config_path, backup_dir, int(self.config.model_file.backup_keep or 10))
+            backup_path = backup_file(
+                model_config_path,
+                self._get_data_dir(),
+                int(self.config.model_file.backup_keep or 10),
+            )
             if backup_path:
                 self.ctx.logger.info("已备份原配置到 %s", backup_path)
 
@@ -415,12 +384,24 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
             self.ctx.logger.error("启动时峰谷切换检查失败：%s", e)
         while True:
             await asyncio.sleep(CHECK_INTERVAL)
+            # debug 静默窗口内：暂停自动检测（安全网关闭），不按真实时间纠正
+            if self._in_debug_pause():
+                continue
             try:
                 await self._check_and_apply()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.ctx.logger.error("峰谷切换调度异常：%s", e)
+
+    def _in_debug_pause(self) -> bool:
+        """是否处于 debug 静默窗口（自动检测安全网已暂停）。"""
+        return self._debug_pause_until is not None and time.time() < self._debug_pause_until
+
+    def _reset_debug_pause(self) -> None:
+        """调用 /switcher debug 后重设静默窗口（重新计时，不叠加）。"""
+        minutes = int(self.config.plugin.debug_pause_minutes or 5)
+        self._debug_pause_until = time.time() + max(minutes, 0) * 60
 
     # ==================== 命令：/llmlist ====================
 
@@ -435,13 +416,15 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
         Command 返回值必须为三元组 (success, response, weight)。
         """
         stream_id = str(kwargs.get("stream_id") or "")
+        # 开关：仅管理员可用
+        if self.config.plugin.llmlist_admin_only and not self._is_admin(str(kwargs.get("user_id") or "")):
+            await self._send_llmlist_fallback(stream_id, "权限不足：/llmlist 已设为仅管理员可用。")
+            return False, "权限不足：仅管理员可用", 1
         try:
             model_config_path = self._get_model_config_path()
             doc, _, _ = read_model_config(model_config_path)
             if doc is None:
-                await self._send_llmlist_fallback(
-                    stream_id, "model_config.toml 解析失败，无法生成模型列表图片。"
-                )
+                await self._send_llmlist_fallback(stream_id, "model_config.toml 解析失败，无法生成模型列表图片。")
                 return False, "model_config.toml 解析失败", 1
 
             html_content = build_report_html(doc)
@@ -506,9 +489,83 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.warning("发送 llmlist 失败提示出错：%s", e)
 
+    # ==================== 命令：/switcher debug ====================
+
+    @Command(
+        "switcher_debug",
+        description="强制切换当前峰谷状态（仅管理员，用于测试配置修改是否正常）",
+        pattern=r"^/?switcher\s+debug\s*$",
+    )
+    async def cmd_switcher_debug(self, **kwargs: Any) -> tuple[bool, str, int]:
+        """强制翻转当前峰谷状态并立即应用，用于测试 model_config.toml 修改代码。
+
+        只做状态翻转与应用，不改变时间判断逻辑；切换后立即开启 debug 静默窗口
+        （自动检测安全网暂停 debug_pause_minutes 分钟，期间调度器不按真实时间纠正），
+        窗口结束后自动恢复自动检测。
+        """
+        stream_id = str(kwargs.get("stream_id") or "")
+        # 强制仅管理员可用
+        if not self._is_admin(str(kwargs.get("user_id") or "")):
+            await self._send_llmlist_fallback(stream_id, "权限不足：/switcher debug 仅管理员可用。")
+            return False, "权限不足：仅管理员可用", 1
+
+        # 当前内部状态（未记录时按真实时间判断）
+        current = self._current_phase or self._get_current_phase()
+        # 强制翻转：峰 ↔ 谷
+        target = "offpeak" if current == "peak" else "peak"
+        try:
+            wrote = await self._check_and_apply(force=True, phase_override=target)
+        except Exception as e:
+            self.ctx.logger.error("switcher debug 强制切换失败：%s", e)
+            await self._send_llmlist_fallback(stream_id, f"强制切换失败：{e}")
+            return False, f"强制切换失败：{e}", 1
+
+        # 重设 debug 静默窗口（重新计时，不叠加）
+        self._reset_debug_pause()
+        minutes = int(self.config.plugin.debug_pause_minutes or 5)
+
+        phase_desc = self._describe_phase(target)
+        if wrote:
+            msg = (
+                f"已强制切换为{phase_desc}（debug 测试）。"
+                f"自动检测已暂停 {minutes} 分钟，期间不会按真实时段纠正；"
+                f"再次执行 /switcher debug 可重新计时。"
+            )
+        else:
+            # 未写入：可能模型未配置/缺失，或目标时段本就与当前一致
+            msg = (
+                f"已强制切换为{phase_desc}，但 model_config.toml 无需修改（可能未配置该时段模型）。"
+                f"自动检测已暂停 {minutes} 分钟。"
+            )
+        await self._send_llmlist_fallback(stream_id, msg)
+        self.ctx.logger.info("switcher debug：%s", msg)
+        return True, msg, 2
+
+    # ==================== 版本兼容 ====================
+
+    def _check_config_version(self) -> None:
+        """检测配置版本并自动兼容旧版配置文件。
+
+        当前版本：1.1.1。旧版本（1.0.0 / 1.1.0）的配置文件缺少
+        admin_users / llmlist_admin_only / debug_pause_minutes 等字段，
+        Runner 在配置注入时已按默认值自动补齐，这里仅做日志提示。
+        """
+        try:
+            raw = self.get_plugin_config_data()
+            current = str((raw.get("plugin") or {}).get("config_version") or "").strip()
+        except Exception:
+            return
+        if current and current != SUPPORTED_CONFIG_VERSION:
+            self.ctx.logger.info(
+                "检测到旧版配置（config_version=%s，当前支持 %s），缺失字段已按默认值自动补齐",
+                current,
+                SUPPORTED_CONFIG_VERSION,
+            )
+
     # ==================== 生命周期 ====================
 
     async def on_load(self) -> None:
+        self._check_config_version()
         self._build_schedule_from_config()
         self._task_models = self._load_task_models()
         self._start_scheduler()
@@ -520,24 +577,26 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         self._stop_scheduler()
+        self._debug_pause_until = None
         self.ctx.logger.info("峰谷模型切换插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         del config_data, version
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             # 配置热重载：重建时段与任务映射，重启调度器并立即应用
+            self._check_config_version()
             self._stop_scheduler()
             self._current_phase = None
             self._last_written_phase = None
             self._last_written_at = None
+            self._debug_pause_until = None  # 配置更新后清除 debug 静默窗口
             self._build_schedule_from_config()
             self._task_models = self._load_task_models()
             self._start_scheduler()
             self.ctx.logger.info("峰谷模型切换插件配置已更新，已重启调度器并应用当前时段")
         elif scope == ON_MODEL_CONFIG_RELOAD:
             # model_config.toml 被热重载。若这是插件自己写入后（10 秒窗口内）触发的热重载回执，
-            # 说明磁盘内容就是插件写出的状态，无需重新应用，避免"写→热重载→再写"死循环刷屏。
-            # 只有外部改动（WebUI/手动编辑）导致的内容变化才需要重新评估。
+            # 说明磁盘内容就是插件写出的状态，无需重新应用，避免「写→热重载→再写」死循环刷屏。
             own_reload = (
                 self._last_written_phase is not None
                 and self._last_written_at is not None
