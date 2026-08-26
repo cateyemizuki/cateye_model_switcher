@@ -47,14 +47,20 @@ from .switcher_core import (
 # 配置版本：与 _manifest.json 的 version 保持同步。
 # 1.0.0 → 1.1.0：新增 llmlist_admin_only 开关与 /switcher debug 命令。
 # 1.1.0 → 1.1.1：/switcher debug 新增静默窗口（debug_pause_minutes，自动检测安全网暂停）。
+# 1.1.1 → 1.1.2：model_config_path 默认改为空（不再把绝对路径固化进配置）；
+#                路径解析改为从插件所在目录出发的相对推导，MaiBot 目录迁移后无需改配置。
 # 旧版本配置文件在加载时自动补齐新字段，无需手动迁移。
-SUPPORTED_CONFIG_VERSION = "1.1.1"
+SUPPORTED_CONFIG_VERSION = "1.1.2"
 
 # 默认 model_config.toml 路径：<MaiBot根目录>/config/model_config.toml
-# 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/
-DEFAULT_MODEL_CONFIG_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "model_config.toml")
-)
+# 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/，故相对插件目录向上两级。
+# 注意：仅在 model_file.model_config_path 留空时使用；每次调用时动态计算，
+# 避免插件目录在导入期之后被移动（如整目录迁移）导致路径失效。
+def _default_model_config_path() -> str:
+    return os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "model_config.toml")
+    )
+
 
 # 默认 bot_config.toml 路径：<MaiBot根目录>/config/bot_config.toml
 DEFAULT_BOT_CONFIG_PATH = os.path.normpath(
@@ -132,8 +138,8 @@ class ModelFileSectionConfig(PluginConfigBase):
     __ui_order__ = 2
 
     model_config_path: str = Field(
-        default=DEFAULT_MODEL_CONFIG_PATH,
-        description="MaiBot model_config.toml 路径（默认 <MaiBot根目录>/config/model_config.toml，可覆盖为绝对路径）",
+        default="",
+        description="MaiBot model_config.toml 路径（留空 = 自动从插件所在目录相对推导 <MaiBot根目录>/config/model_config.toml；填写 = 使用填写的路径，支持绝对或相对路径）",
     )
     backup: bool = Field(
         default=True,
@@ -205,8 +211,15 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
     # ==================== 配置读取 ====================
 
     def _get_model_config_path(self) -> str:
+        """解析 model_config.toml 路径。
+
+        - 配置 `model_file.model_config_path` 填写了路径 → 直接使用（绝对或相对均按填写值，
+          相对路径以当前工作目录为基准，建议填写绝对路径）；
+        - 留空 → 从插件所在目录出发相对推导：<插件目录>/../../config/model_config.toml
+          （即 <MaiBot根目录>/config/model_config.toml，插件目录移动后依然正确）。
+        """
         path = str(self.config.model_file.model_config_path or "").strip()
-        return os.path.normpath(path) if path else DEFAULT_MODEL_CONFIG_PATH
+        return os.path.normpath(path) if path else _default_model_config_path()
 
     def _get_data_dir(self) -> str:
         # ctx.paths.data_dir = data/plugins/<plugin_id>；备份统一放其 backup 子目录
@@ -546,9 +559,11 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
     def _check_config_version(self) -> None:
         """检测配置版本并自动兼容旧版配置文件。
 
-        当前版本：1.1.1。旧版本（1.0.0 / 1.1.0）的配置文件缺少
+        当前版本：1.1.2。旧版本（1.0.0 / 1.1.0 / 1.1.1）的配置文件缺少
         admin_users / llmlist_admin_only / debug_pause_minutes 等字段，
         Runner 在配置注入时已按默认值自动补齐，这里仅做日志提示。
+        另注意：1.1.1 及更早版本可能把 model_config_path 固化为绝对路径写入配置，
+        若该路径已失效，请在 WebUI 将 model_file.model_config_path 清空以启用相对解析。
         """
         try:
             raw = self.get_plugin_config_data()
