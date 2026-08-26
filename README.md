@@ -44,7 +44,7 @@ enabled = true                # 是否启用插件
 admin_users = []              # 管理员列表（用户ID 或 平台:用户ID，如 "123456789" 或 "qq:123456789"；/switcher debug 强制仅管理员可用）
 llmlist_admin_only = false    # 是否限制 /llmlist 仅管理员可用（默认关，所有人可用）
 debug_pause_minutes = 5       # /switcher debug 后暂停自动检测（安全网）的分钟数（默认 5）
-config_version = "1.1.1"      # 配置版本（与插件版本同步，UI 中隐藏）
+config_version = "1.1.2"      # 配置版本（与插件版本同步，UI 中隐藏）
 
 [schedule]
 peak_periods = ["09:00-12:00", "14:00-18:00"]   # 峰时时段（北京时间 HH:MM-HH:MM，支持跨天如 "22:00-02:00"）
@@ -60,7 +60,7 @@ planner_offpeak_model = "[OCG]deepseek-v4-flash-opencode go"
 # 全部留空 → 该任务不参与切换
 
 [model_file]
-model_config_path = ""        # 留空 = 自动定位 <MaiBot根目录>/config/model_config.toml；可填绝对路径覆盖
+model_config_path = ""        # 留空 = 从插件所在目录相对推导 <MaiBot根目录>/config/model_config.toml；填写 = 使用填写的路径（绝对或相对）
 backup = true                 # 修改前是否备份
 backup_keep = 10              # 备份保留份数
 ```
@@ -80,7 +80,7 @@ backup_keep = 10              # 备份保留份数
 | `schedule.exclude_weekdays` | 排除峰时的星期数组，`1`=周一 … `7`=周日。默认 `[6, 7]`（周六日整天保持谷时） |
 | `task_mapping.<任务>_peak_model` | 对应任务峰时使用的模型名，必须与 `[[models]]` 的 `name` 完全一致；留空则跳过该任务 |
 | `task_mapping.<任务>_offpeak_model` | 对应任务谷时使用的模型名，同上 |
-| `model_file.model_config_path` | `model_config.toml` 路径。默认自动推导为插件目录上两级 `config/model_config.toml`；可填绝对路径 |
+| `model_file.model_config_path` | `model_config.toml` 路径。留空 = 从插件所在目录相对推导 `<MaiBot根目录>/config/model_config.toml`（插件目录移动后依然正确）；填写 = 使用填写的路径（绝对或相对，建议绝对路径） |
 | `model_file.backup` | 修改前备份到 `data/plugins/cateye_model_switcher/backup/`（默认开） |
 | `model_file.backup_keep` | 备份保留份数（默认 10） |
 
@@ -148,7 +148,7 @@ selection_strategy = "sequential"   # 必须：按配置顺序优先选择，首
 
 - **模型不在 `model_list` 中**：插件只做「提升到首位」，**不会**把模型添加进列表。请先在对应任务 `model_list` 中加入该模型。
 - **模型名不匹配**：`peak_model` / `offpeak_model` 必须与 `[[models]]` 下 `name` 字段**完全一致**（含空格、括号、大小写）。
-- **修改不生效**：检查 `model_file.model_config_path` 指向是否正确；确认 `[[models]]` 与 `[model_task_config]` 非空；确认 `selection_strategy` 为 `"sequential"`。
+- **修改不生效**：检查 `model_file.model_config_path` 指向是否正确（留空即自动定位到 `<MaiBot根目录>/config/model_config.toml`，迁移 MaiBot 目录后无需改配置）；确认 `[[models]]` 与 `[model_task_config]` 非空；确认 `selection_strategy` 为 `"sequential"`。
 - **想临时停用**：WebUI 关闭 `plugin.enabled`，或把某任务 `peak_model`/`offpeak_model` 都留空。
 - **debug 后想立即切回真实状态**：再执行一次 `/switcher debug`（翻转回原状态），或等静默窗口结束后调度器自动按真实时段纠正；也可在 WebUI 保存一次插件配置触发热重载（会清除静默窗口）。
 - **静默窗口时长如何调整**：改 `plugin.debug_pause_minutes`（分钟），保存配置后热重载生效；静默期内再次 debug 会按新值重新计时。
@@ -160,6 +160,7 @@ selection_strategy = "sequential"   # 必须：按配置顺序优先选择，首
 | 1.0.0 | 初始版本：峰谷定时切换、`/llmlist` 图片报表、TOML 格式保真、自动备份 |
 | 1.1.0 | 新增 `/switcher debug` 命令（仅管理员）；`admin_users` 插件自管管理员；`llmlist_admin_only` 开关；旧配置自动兼容 |
 | 1.1.1 | `/switcher debug` 新增静默窗口：调用后自动检测（安全网）暂停 `debug_pause_minutes` 分钟（默认 5，可配置），静默期内再次调用重新计时、不叠加 |
+| 1.1.2 | `model_file.model_config_path` 默认改为空，不再把绝对路径固化进配置；路径解析改为从插件所在目录出发的相对推导（`<插件目录>/../../config/model_config.toml`），修复 MaiBot 目录迁移后旧路径失效的问题。升级后请在 WebUI 将 `model_config_path` 清空以启用相对解析 |
 
 ## 文件结构
 
