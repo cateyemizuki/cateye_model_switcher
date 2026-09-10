@@ -49,8 +49,10 @@ from .switcher_core import (
 # 1.1.0 → 1.1.1：/switcher debug 新增静默窗口（debug_pause_minutes，自动检测安全网暂停）。
 # 1.1.1 → 1.1.2：model_config_path 默认改为空（不再把绝对路径固化进配置）；
 #                路径解析改为从插件所在目录出发的相对推导，MaiBot 目录迁移后无需改配置。
+# 1.1.2 → 1.1.3：为全部配置项补充/完善了用户友好的中文注释与说明（悬停提示），
+#                完善配置节说明；插件功能与行为不变。
 # 旧版本配置文件在加载时自动补齐新字段，无需手动迁移。
-SUPPORTED_CONFIG_VERSION = "1.1.2"
+SUPPORTED_CONFIG_VERSION = "1.1.3"
 
 # 默认 model_config.toml 路径：<MaiBot根目录>/config/model_config.toml
 # 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/，故相对插件目录向上两级。
@@ -80,6 +82,8 @@ CHECK_INTERVAL = 60
 
 
 class ScheduleSectionConfig(PluginConfigBase):
+    """峰谷时段（schedule 配置节）。"""
+
     __ui_label__ = "峰谷时段"
     __ui_icon__ = "schedule"
     __ui_order__ = 1
@@ -87,14 +91,26 @@ class ScheduleSectionConfig(PluginConfigBase):
     peak_periods: list[str] = Field(
         default_factory=lambda: list(DEFAULT_PEAK_PERIODS),
         description="峰时时段列表（北京时间 HH:MM-HH:MM，支持跨天；例：09:00-12:00）",
+        json_schema_extra={
+            "label": "峰时时段",
+            "hint": "峰时时间段，北京时间",
+        },
     )
     offpeak_periods: list[str] = Field(
         default_factory=list,
         description="谷时时段列表（可选，留空则自动取峰时之外的所有时间；格式同峰时）",
+        json_schema_extra={
+            "label": "谷时时段",
+            "hint": "谷时时间段，可留空",
+        },
     )
     exclude_weekdays: list[int] = Field(
         default_factory=lambda: list(DEFAULT_EXCLUDE_WEEKDAYS),
         description="排除峰时的星期（1=周一 ... 7=周日；如 [6,7] 表示周六日不执行峰时切换）",
+        json_schema_extra={
+            "label": "排除峰时的星期",
+            "hint": "不执行峰时的星期",
+        },
     )
 
 
@@ -113,6 +129,10 @@ def _build_task_mapping_config() -> type[PluginConfigBase]:
             Field(
                 default="",
                 description=f"{label}任务：峰时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
+                json_schema_extra={
+                    "label": f"{label}峰时模型",
+                    "hint": f"{label}峰时模型名",
+                },
             ),
         )
         fields[f"{task}_offpeak_model"] = (
@@ -120,9 +140,14 @@ def _build_task_mapping_config() -> type[PluginConfigBase]:
             Field(
                 default="",
                 description=f"{label}任务：谷时使用的模型名（须与 model_config.toml 的 [[models]].name 完全一致；留空则跳过该任务）",
+                json_schema_extra={
+                    "label": f"{label}谷时模型",
+                    "hint": f"{label}谷时模型名",
+                },
             ),
         )
     cls = create_model("TaskMappingConfig", __base__=PluginConfigBase, **fields)
+    cls.__doc__ = "任务模型映射（task_mapping 配置节）。"
     cls.__ui_label__ = "任务模型映射"
     cls.__ui_icon__ = "swap_horiz"
     cls.__ui_order__ = 1
@@ -133,6 +158,8 @@ TaskMappingSectionConfig = _build_task_mapping_config()
 
 
 class ModelFileSectionConfig(PluginConfigBase):
+    """模型配置文件（model_file 配置节）。"""
+
     __ui_label__ = "模型配置文件"
     __ui_icon__ = "settings"
     __ui_order__ = 2
@@ -140,34 +167,67 @@ class ModelFileSectionConfig(PluginConfigBase):
     model_config_path: str = Field(
         default="",
         description="MaiBot model_config.toml 路径（留空 = 自动从插件所在目录相对推导 <MaiBot根目录>/config/model_config.toml；填写 = 使用填写的路径，支持绝对或相对路径）",
+        json_schema_extra={
+            "label": "model_config.toml 路径",
+            "hint": "留空自动推导路径",
+        },
     )
     backup: bool = Field(
         default=True,
         description="修改前是否备份 model_config.toml 到 data/plugins/cateye_model_switcher/backup",
+        json_schema_extra={
+            "label": "修改前备份",
+            "hint": "切换前备份原文件",
+        },
     )
     backup_keep: int = Field(
         default=10,
         description="备份保留份数",
+        json_schema_extra={
+            "label": "备份保留份数",
+            "hint": "保留最近备份份数",
+        },
     )
 
 
 class PluginSectionConfig(PluginConfigBase):
+    """插件（plugin 配置节）。"""
+
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     admin_users: list[str] = Field(
         default_factory=list,
         description="管理员列表（格式：用户ID 或 平台:用户ID，如 \"123456789\" 或 \"qq:123456789\"；留空则无管理员）",
+        json_schema_extra={
+            "label": "管理员列表",
+            "hint": "管理员名单",
+        },
     )
     llmlist_admin_only: bool = Field(
         default=False,
         description="是否限制 /llmlist 命令仅管理员可用（默认关，所有人可用）",
+        json_schema_extra={
+            "label": "仅管理员可用 /llmlist",
+            "hint": "llmlist仅管理员可用",
+        },
     )
     debug_pause_minutes: int = Field(
         default=5,
         description="调用 /switcher debug 后暂停自动检测（安全网）的分钟数（默认 5；静默期间再次 debug 会重新计时，不叠加）",
+        json_schema_extra={
+            "label": "debug 静默分钟数",
+            "hint": "自动检测暂停分钟数",
+        },
     )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
@@ -176,11 +236,14 @@ class PluginSectionConfig(PluginConfigBase):
             "disabled": True,
             "hidden": True,
             "label": "配置版本",
+            "hint": "配置版本，勿改",
         },
     )
 
 
 class CateyeModelSwitcherConfig(PluginConfigBase):
+    """插件完整配置。"""
+
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     schedule: ScheduleSectionConfig = Field(default_factory=ScheduleSectionConfig)
     task_mapping: TaskMappingSectionConfig = Field(default_factory=TaskMappingSectionConfig)

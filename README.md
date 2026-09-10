@@ -179,15 +179,10 @@ cateye_model_switcher/
 
 本插件为标准 **MaiBot SDK 插件**（基于 `maibot-plugin-sdk`，使用 `MaiBotPlugin` / `PluginConfigBase` / `Field` / `Command` 等 SDK 组件；配置模型、生命周期、命令注册均由 SDK 提供）。
 
-- **`switcher_core.py`**：核心逻辑（时段解析、TOML 读写、任务切换、任务清单定义）**不依赖 SDK**，是纯 Python 模块，便于离线单元测试；
+- **`switcher_core.py`**：核心逻辑（时段解析、TOML 读写、任务切换、任务清单定义）**不依赖 SDK**，是纯 Python 模块；
 - **`report_renderer.py`**：HTML 报表渲染，同样不依赖 SDK；
 - **`plugin.py`**：SDK 插件入口，依赖 `maibot_sdk`（由 MaiBot Runner 提供），本地开发需先安装 SDK 才能导入。
 
 ```bash
 pip install maibot-plugin-sdk tomlkit   # 本地开发依赖
-
-python test/test_model_switcher.py        # 核心逻辑单元测试（时段/切换/TOML 往返/空值容错，不依赖 SDK）
-python test/test_model_switcher_e2e.py    # 端到端模拟（峰→谷→峰，inode 检查，不依赖 SDK）
-python test/test_report_renderer.py       # 报表渲染单元测试（不依赖 SDK）
-python test/test_plugin_integration.py    # 插件类集成（stub SDK，无需真实 SDK 环境）
 ```
