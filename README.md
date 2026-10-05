@@ -1,12 +1,10 @@
-# 梁文峰&梁文谷模型切换（MaiBot 插件）
+# 峰谷模型切换（MaiBot 插件）
 
-> ## ⚠️ 非规范声明
+> ## ⚠️ 工作原理与风险提示
 >
-> 本插件**不符合 MaiBot 插件规范**：
-> - MaiBot 的插件架构**不允许插件直接修改框架自身的配置文件**（如 `model_config.toml`、`bot_config.toml`）；
-> - 本插件使用了**直接的 IO 操作**读写 `model_config.toml` 文件，这同样超出插件架构的允许范围；
-> - 因此本插件**仅作者自己使用**，**不会上传至插件市场**（MaiBot 插件中心）；
-> - 使用本插件造成的一切后果（配置损坏、热重载异常等）由使用者自行承担。
+> - MaiBot 插件架构未提供"修改模型配置"的标准能力，本插件采用**直接读写 `model_config.toml` 文件**（tomlkit 保真写回 + 宿主热重载生效）的方式实现切换；
+> - 这属于超出标准 `ctx.*` 能力面的**直接 IO 操作**，请在充分了解原理后使用；安装后请保持「修改前备份」开启（默认开启），备份位于 `data/plugins/cateye_model_switcher/backup/`；
+> - 使用本插件造成配置损坏等问题的风险由使用者自行评估，可随时在 WebUI 停用本插件。
 
 按**北京时间（UTC+8）**的峰谷时段，定时调整 MaiBot `model_config.toml` 中各任务的模型列表顺序：把当前时段（峰时 / 谷时）指定的模型提升到 `model_list` **首位**（优先使用），在不重启服务的前提下平衡模型成本与性能。
 
@@ -32,7 +30,7 @@
 2. 重启 MaiBot，或在 WebUI 插件中心安装。
 3. 插件为标准 SDK 插件（基于 `maibot-plugin-sdk`），SDK 由 MaiBot Runner 内置提供，**无需用户手动安装**；`tomlkit` 依赖已声明于 `_manifest.json`，Host 会自动安装。
 
-> 兼容：`host_application` `1.0.0 ~ 1.99.99`，`sdk` `2.0.0 ~ 2.99.99`（Manifest v2）。
+> 兼容：`host_application` `1.0.0 ~ 1.99.99`（兼容 MaiBot 1.2.x 与 1.3.x），`sdk` `2.8.0 ~ 2.99.99`（Manifest v2）。
 
 ## 配置
 
@@ -44,7 +42,7 @@ enabled = true                # 是否启用插件
 admin_users = []              # 管理员列表（用户ID 或 平台:用户ID，如 "123456789" 或 "qq:123456789"；/switcher debug 强制仅管理员可用）
 llmlist_admin_only = false    # 是否限制 /llmlist 仅管理员可用（默认关，所有人可用）
 debug_pause_minutes = 5       # /switcher debug 后暂停自动检测（安全网）的分钟数（默认 5）
-config_version = "1.1.2"      # 配置版本（与插件版本同步，UI 中隐藏）
+config_version = "1.2.0"      # 配置版本（与插件版本同步，UI 中隐藏）
 
 [schedule]
 peak_periods = ["09:00-12:00", "14:00-18:00"]   # 峰时时段（北京时间 HH:MM-HH:MM，支持跨天如 "22:00-02:00"）
@@ -161,6 +159,8 @@ selection_strategy = "sequential"   # 必须：按配置顺序优先选择，首
 | 1.1.0 | 新增 `/switcher debug` 命令（仅管理员）；`admin_users` 插件自管管理员；`llmlist_admin_only` 开关；旧配置自动兼容 |
 | 1.1.1 | `/switcher debug` 新增静默窗口：调用后自动检测（安全网）暂停 `debug_pause_minutes` 分钟（默认 5，可配置），静默期内再次调用重新计时、不叠加 |
 | 1.1.2 | `model_file.model_config_path` 默认改为空，不再把绝对路径固化进配置；路径解析改为从插件所在目录出发的相对推导（`<插件目录>/../../config/model_config.toml`），修复 MaiBot 目录迁移后旧路径失效的问题。升级后请在 WebUI 将 `model_config_path` 清空以启用相对解析 |
+| 1.1.3 | 为全部配置项补充/完善中文标签与悬停提示，完善配置节说明；功能与行为不变 |
+| 1.2.0 | 适配 MaiBot 1.3.0 / 新版插件市场规范：全部配置项与配置分组补充英文 i18n（WebUI 界面语言为英文时显示英文标签）；manifest 更新描述与兼容区间声明（`sdk.min_version` 2.8.0）、新增 `changelog` 字段；移除"不上传插件市场"声明，按新版插件市场要求完善 README |
 
 ## 文件结构
 

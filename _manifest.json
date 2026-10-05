@@ -1,14 +1,15 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.model.switcher",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "name": "峰谷模型切换",
-  "description": "根据北京时间（UTC+8）峰谷时段定时调整 MaiBot model_config.toml 中各任务的模型列表顺序，将峰时/谷时指定的模型提升到列表首位（优先使用），在不重启服务的前提下平衡模型成本与性能。【⚠️ 非规范插件】直接修改 model_config.toml 与直接 IO 操作不符合 MaiBot 插件规范，仅作者自用，不上传插件市场。",
+  "description": "根据北京时间（UTC+8）峰谷时段定时调整 MaiBot model_config.toml 中各任务的模型列表顺序，将峰时/谷时指定的模型提升到列表首位（优先使用），在不重启服务的前提下平衡模型成本与性能。注意：本插件直接读写 model_config.toml 并依赖宿主热重载生效，安装前请确认已开启修改前备份。",
   "author": {
     "name": "cateye",
     "url": "https://github.com/cateyemizuki"
   },
   "license": "MIT",
+  "changelog": "CHANGELOG.md",
   "urls": {
     "repository": "https://github.com/cateyemizuki/cateye_model_switcher",
     "homepage": "https://github.com/cateyemizuki/cateye_model_switcher",
@@ -20,7 +21,7 @@
     "max_version": "1.99.99"
   },
   "sdk": {
-    "min_version": "2.0.0",
+    "min_version": "2.8.0",
     "max_version": "2.99.99"
   },
   "dependencies": [
@@ -46,7 +47,8 @@
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [
-      "zh-CN"
+      "zh-CN",
+      "en"
     ]
   }
 }

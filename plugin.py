@@ -51,8 +51,11 @@ from .switcher_core import (
 #                路径解析改为从插件所在目录出发的相对推导，MaiBot 目录迁移后无需改配置。
 # 1.1.2 → 1.1.3：为全部配置项补充/完善了用户友好的中文注释与说明（悬停提示），
 #                完善配置节说明；插件功能与行为不变。
+# 1.1.3 → 1.2.0：适配 MaiBot 1.3.0 / 新版插件市场规范：全部配置项补充英文 i18n
+#                （json_schema_extra.i18n["en"]），全部配置分组补充 __ui_i18n__；
+#                更新 manifest 描述与兼容区间声明（sdk.min_version 2.8.0）。
 # 旧版本配置文件在加载时自动补齐新字段，无需手动迁移。
-SUPPORTED_CONFIG_VERSION = "1.1.3"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
 
 # 默认 model_config.toml 路径：<MaiBot根目录>/config/model_config.toml
 # 插件目录位于 <MaiBot根目录>/plugins/<plugin_id>/，故相对插件目录向上两级。
@@ -78,6 +81,33 @@ DEFAULT_EXCLUDE_WEEKDAYS = [6, 7]
 CHECK_INTERVAL = 60
 
 
+# ==================== WebUI i18n 辅助 ====================
+
+
+def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
+    """字段级英文翻译（并入 json_schema_extra；WebUI 按 i18n[locale]["label"/"hint"] 取用）。
+
+    注意键名用 "en"（而非 "en_US"），与 manifest i18n.supported_locales 对应。
+    """
+    entry: Dict[str, str] = {"label": en_label}
+    if en_hint:
+        entry["hint"] = en_hint
+    return {"i18n": {"en": entry}}
+
+
+# 各任务英文名（供 task_mapping 平铺字段的英文 i18n 使用，顺序与 TASKS 一致）
+TASKS_EN: Dict[str, str] = {
+    "replyer": "Replyer",
+    "planner": "Planner",
+    "memory": "Memory",
+    "mid_memory": "Mid-term Memory",
+    "utils": "Utils",
+    "learner": "Learner",
+    "expression_use": "Expression Use",
+    "emoji": "Emoji",
+}
+
+
 # ==================== 配置模型 ====================
 
 
@@ -85,6 +115,12 @@ class ScheduleSectionConfig(PluginConfigBase):
     """峰谷时段（schedule 配置节）。"""
 
     __ui_label__ = "峰谷时段"
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Peak / Off-Peak Schedule",
+            "description": "Peak and off-peak periods in Beijing time (UTC+8).",
+        }
+    }
     __ui_icon__ = "schedule"
     __ui_order__ = 1
 
@@ -94,6 +130,7 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "峰时时段",
             "hint": "峰时时间段，北京时间",
+            **_ui_i18n("Peak periods", "Peak periods in Beijing time, HH:MM-HH:MM"),
         },
     )
     offpeak_periods: list[str] = Field(
@@ -102,6 +139,7 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "谷时时段",
             "hint": "谷时时间段，可留空",
+            **_ui_i18n("Off-peak periods", "Leave empty to use all non-peak time"),
         },
     )
     exclude_weekdays: list[int] = Field(
@@ -110,6 +148,7 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "排除峰时的星期",
             "hint": "不执行峰时的星期",
+            **_ui_i18n("Excluded weekdays", "1=Mon ... 7=Sun; peak switching skipped on these days"),
         },
     )
 
@@ -124,6 +163,7 @@ def _build_task_mapping_config() -> type[PluginConfigBase]:
     """
     fields: Dict[str, Any] = {}
     for task, label in TASKS:
+        en = TASKS_EN.get(task, task)
         fields[f"{task}_peak_model"] = (
             str,
             Field(
@@ -132,6 +172,10 @@ def _build_task_mapping_config() -> type[PluginConfigBase]:
                 json_schema_extra={
                     "label": f"{label}峰时模型",
                     "hint": f"{label}峰时模型名",
+                    **_ui_i18n(
+                        f"{en} peak model",
+                        f"Model used by the {en} task during peak hours (must match [[models]].name)",
+                    ),
                 },
             ),
         )
@@ -143,12 +187,22 @@ def _build_task_mapping_config() -> type[PluginConfigBase]:
                 json_schema_extra={
                     "label": f"{label}谷时模型",
                     "hint": f"{label}谷时模型名",
+                    **_ui_i18n(
+                        f"{en} off-peak model",
+                        f"Model used by the {en} task during off-peak hours (must match [[models]].name)",
+                    ),
                 },
             ),
         )
     cls = create_model("TaskMappingConfig", __base__=PluginConfigBase, **fields)
     cls.__doc__ = "任务模型映射（task_mapping 配置节）。"
     cls.__ui_label__ = "任务模型映射"
+    cls.__ui_i18n__ = {
+        "en": {
+            "title": "Task Model Mapping",
+            "description": "Peak / off-peak model per task; leave both empty to skip a task.",
+        }
+    }
     cls.__ui_icon__ = "swap_horiz"
     cls.__ui_order__ = 1
     return cls
@@ -161,6 +215,12 @@ class ModelFileSectionConfig(PluginConfigBase):
     """模型配置文件（model_file 配置节）。"""
 
     __ui_label__ = "模型配置文件"
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Model Config File",
+            "description": "model_config.toml path and backup options.",
+        }
+    }
     __ui_icon__ = "settings"
     __ui_order__ = 2
 
@@ -170,6 +230,10 @@ class ModelFileSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "model_config.toml 路径",
             "hint": "留空自动推导路径",
+            **_ui_i18n(
+                "model_config.toml path",
+                "Leave empty to auto-resolve <MaiBot root>/config/model_config.toml",
+            ),
         },
     )
     backup: bool = Field(
@@ -178,6 +242,7 @@ class ModelFileSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "修改前备份",
             "hint": "切换前备份原文件",
+            **_ui_i18n("Back up before writing", "Back up model_config.toml before switching"),
         },
     )
     backup_keep: int = Field(
@@ -186,6 +251,7 @@ class ModelFileSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "备份保留份数",
             "hint": "保留最近备份份数",
+            **_ui_i18n("Backups to keep", "Number of recent backups to keep"),
         },
     )
 
@@ -194,6 +260,12 @@ class PluginSectionConfig(PluginConfigBase):
     """插件（plugin 配置节）。"""
 
     __ui_label__ = "插件"
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Plugin",
+            "description": "General plugin settings: switch, admins and debug pause.",
+        }
+    }
     __ui_icon__ = "package"
     __ui_order__ = 0
 
@@ -203,6 +275,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "启用插件",
             "hint": "插件总开关",
+            **_ui_i18n("Enable plugin", "Master switch of the plugin"),
         },
     )
     admin_users: list[str] = Field(
@@ -211,6 +284,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "管理员列表",
             "hint": "管理员名单",
+            **_ui_i18n("Admin users", "User IDs or platform:ID; empty means no admins"),
         },
     )
     llmlist_admin_only: bool = Field(
@@ -219,6 +293,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "仅管理员可用 /llmlist",
             "hint": "llmlist仅管理员可用",
+            **_ui_i18n("/llmlist admin only", "Restrict /llmlist to admins (default off)"),
         },
     )
     debug_pause_minutes: int = Field(
@@ -227,6 +302,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "debug 静默分钟数",
             "hint": "自动检测暂停分钟数",
+            **_ui_i18n("Debug pause minutes", "Pause auto-switching for N minutes after /switcher debug"),
         },
     )
     config_version: str = Field(
@@ -237,6 +313,7 @@ class PluginSectionConfig(PluginConfigBase):
             "hidden": True,
             "label": "配置版本",
             "hint": "配置版本，勿改",
+            **_ui_i18n("Config version", "Do not edit"),
         },
     )
 
@@ -622,7 +699,7 @@ class CateyeModelSwitcherPlugin(MaiBotPlugin):
     def _check_config_version(self) -> None:
         """检测配置版本并自动兼容旧版配置文件。
 
-        当前版本：1.1.2。旧版本（1.0.0 / 1.1.0 / 1.1.1）的配置文件缺少
+        当前版本：1.2.0。旧版本（1.0.0 ~ 1.1.3）的配置文件缺少
         admin_users / llmlist_admin_only / debug_pause_minutes 等字段，
         Runner 在配置注入时已按默认值自动补齐，这里仅做日志提示。
         另注意：1.1.1 及更早版本可能把 model_config_path 固化为绝对路径写入配置，
