@@ -1,188 +1,181 @@
 # 峰谷模型切换（MaiBot 插件）
 
-> ## ⚠️ 工作原理与风险提示
->
-> - MaiBot 插件架构未提供"修改模型配置"的标准能力，本插件采用**直接读写 `model_config.toml` 文件**（tomlkit 保真写回 + 宿主热重载生效）的方式实现切换；
-> - 这属于超出标准 `ctx.*` 能力面的**直接 IO 操作**，请在充分了解原理后使用；安装后请保持「修改前备份」开启（默认开启），备份位于 `data/plugins/cateye_model_switcher/backup/`；
-> - 使用本插件造成配置损坏等问题的风险由使用者自行评估，可随时在 WebUI 停用本插件。
+按北京时间（UTC+8）的峰时与谷时，自动调整 MaiBot `model_config.toml` 中各任务的模型顺序：把当前时段指定的模型提升到 `model_list` 首位。任务的 `selection_strategy` 为 `"sequential"`（按列表顺序选择）时，首位即优先使用的模型；高峰时段可用性能更好的模型，低谷时段切回成本更低的模型，切换过程不需要重启 MaiBot。
 
-按**北京时间（UTC+8）**的峰谷时段，定时调整 MaiBot `model_config.toml` 中各任务的模型列表顺序：把当前时段（峰时 / 谷时）指定的模型提升到 `model_list` **首位**（优先使用），在不重启服务的前提下平衡模型成本与性能。
+插件只处理 8 个任务：`replyer`、`planner`、`memory`、`mid_memory`、`utils`、`learner`、`expression_use`、`emoji`。`vlm`、`voice`、`embedding` 不会被改动。
 
-> 示例：工作日（峰时）优先用其他低成本模型；夜间与周末（谷时）自动切回deepseek系列模型。
+## 使用前须知
 
-## 功能
-
-- **峰谷时段自定义**：峰时支持多个时间段（精确到分钟、支持跨天）；谷时默认取峰时之外的所有时间，也可显式指定；支持按星期排除峰时（如周六日）。
-- **任务范围限定**：仅调整 8 个任务（replyer / planner / memory / mid_memory / utils / learner / expression_use / emoji）；vlm / voice / embedding 不受影响。
-- **优先切换**：把指定模型移动到 `model_list` 索引 0，其余模型顺序不变（配合 `selection_strategy = "sequential"` 即优先使用）。
-- **静默跳过**：某任务峰/谷模型任一未配置时，该任务全部切换静默跳过，不打印日志。
-- **容错警告**：模型未在 `[[models]]` 中定义、或不在任务 `model_list` 中时，输出警告并跳过该任务。
-- **无需重启**：修改后由 MaiBot 文件监听自动热重载生效。
-- **TOML 格式保真**：用 `tomlkit` 解析/写回，保留注释与空行、保持行尾风格（CRLF/LF）、**原地写入同一文件**（保持 inode，避免 FileWatcher 丢失监听）。
-- **自动备份**：每次实际修改前备份原文件到插件数据目录（保留最近 N 份）。
-- **`/llmlist` 命令**：以图片形式查看所有任务的模型列表（首位模型带「优先」徽章，动态/固定任务分组展示）。默认所有人可用，可配置为仅管理员可用。
-- **`/switcher debug` 命令**：**仅管理员可用**，强制翻转当前峰谷状态并立即应用；调用后自动检测（安全网）暂停 `debug_pause_minutes` 分钟（默认 5，可配置；静默期内再次调用重新计时、不叠加），用于测试切换代码是否正常。
-- **版本自动兼容**：旧版配置文件自动补齐新增字段（`admin_users` / `llmlist_admin_only` / `debug_pause_minutes`），无需手动迁移。
+- **直接读写配置文件**：本插件直接读写 `<MaiBot根目录>/config/model_config.toml`，不经过宿主配置接口。运行 MaiBot 的进程必须对该文件有读写权限。
+- **依赖宿主热重载**：文件写入后，由宿主对 `model_config.toml` 的热重载使新顺序生效。宿主未启用该热重载时，磁盘内容会更新，但运行中的模型选择不会改变。
+- **修改前备份，但不自动回滚**：`model_file.backup` 默认开启。备份成功时，原文件会在写入前复制到插件数据目录下的 `backup/` 子目录，日志打印完整路径；备份失败时不会中止写入，也没有单独提示。
+- **写入失败可能损坏文件**：文件缺失或解析失败只记录日志并跳过本次切换；写入失败同样只记录错误并返回，不会用备份恢复。写回时先以 `open(..., "w")` 截断再写入，写入或关闭过程中出错可能留下不完整的 `model_config.toml`；若已有备份，可用 `backup/` 中的文件手动恢复，没有备份时只能手工修复或重建配置。
+- **停止方式**：在 WebUI 关闭 `plugin.enabled` 或停用插件，即可停止自动改写。已经写入的模型顺序会保持不变。
 
 ## 安装
 
-1. 将插件目录（含 `_manifest.json`、`plugin.py` 等）放入 MaiBot 的 `plugins/` 目录。
-2. 重启 MaiBot，或在 WebUI 插件中心安装。
-3. 插件为标准 SDK 插件（基于 `maibot-plugin-sdk`），SDK 由 MaiBot Runner 内置提供，**无需用户手动安装**；`tomlkit` 依赖已声明于 `_manifest.json`，Host 会自动安装。
+1. 把插件目录放到 `<MaiBot根目录>/plugins/<插件目录>/`，在 WebUI 插件中心安装，或重启 MaiBot。
+2. 确认 MaiBot 进程能读写 `config/model_config.toml`，并能创建插件数据目录。
+3. 在 `model_config.toml` 中确认参与切换的任务使用 `selection_strategy = "sequential"`。插件只调整 `model_list` 顺序，其他策略下首位模型不保证生效。
+4. 在插件配置中为需要的任务填写峰时/谷时模型，保存后插件会按当前时段应用。
 
-> 兼容：`host_application` `1.0.0 ~ 1.99.99`（兼容 MaiBot 1.2.x 与 1.3.x），`sdk` `2.8.0 ~ 2.99.99`（Manifest v2）。
+依赖与兼容：
+
+- 清单声明 Python 包依赖 `tomlkit >= 0.13.3`，用于保真读写 TOML。代码另外导入 `maibot_sdk` 与 `pydantic`，清单未声明为依赖，需由宿主运行环境提供。
+- Manifest v2；清单声明 `host_application` 1.0.0 ~ 1.99.99、`sdk` 2.8.0 ~ 2.99.99。
+- 声明能力：`send.text`、`send.image`、`send.forward`、`render.html2png`。
+
+`model_config.toml` 位置：
+
+- `model_file.model_config_path` 留空时，从插件文件所在目录向上两级推导：`<插件目录>/../../config/model_config.toml`，这要求插件目录位于 `<MaiBot根目录>/plugins/` 下。
+- 目录布局不同（例如 WebUI 安装到其他位置）时，请把 `model_file.model_config_path` 填为实际文件的绝对路径。
+
+## 工作原理
+
+### 时段判定
+
+所有判断使用北京时间（UTC+8），与宿主系统时区无关。
+
+1. 当天星期命中 `schedule.exclude_weekdays` → 谷时。
+2. `schedule.offpeak_periods` 非空 → 峰时 = 不在任何谷时段内，此时 `peak_periods` 不参与判断。
+3. `schedule.offpeak_periods` 为空 → 峰时 = 落在任一 `peak_periods` 时段内，其余时间为谷时。
+
+时段格式为 `HH:MM-HH:MM`，左闭右开：`09:00-12:00` 包含 09:00、不包含 12:00。开始时间晚于结束时间视为跨天，例如 `22:00-02:00`。
+
+默认配置下，周一至周五 09:00-12:00、14:00-18:00 为峰时，其余时间（含周末）为谷时。
+
+### 切换规则
+
+- 只处理上文 8 个任务。每个任务的峰时模型与谷时模型都必须在配置中填写，任一为空则该任务整体跳过，不产生日志。
+- 模型名必须与 `[[models]]` 的 `name` 完全一致，并且已存在于该任务的 `model_list` 中，否则记录 WARN 并跳过该任务；插件不会把模型加入列表。
+- 模型已在首位时不改动；否则从原位置删除并插入到索引 0，其余模型的相对顺序不变。
+- 插件只调整 `model_list` 顺序，不修改任务的 `selection_strategy`。要让调整后的首位模型真正被优先使用，对应任务必须设为 `selection_strategy = "sequential"`（按列表顺序选择）；其他策略下顺序调整不保证影响实际选型。
+
+### 触发与写入
+
+- `plugin.enabled` 为开时，插件加载后立即应用一次当前时段，之后每 60 秒检查一次；只有判定时段与当前记录的时段不同才继续。
+- 有任务需要调整时：读取 TOML → 调整 `model_list` → 备份 → 与磁盘内容做字节级比较 → 原地写入。写入保留原文件的行尾风格（CRLF/LF）、注释与空行，并直接覆盖同一文件而不替换 inode，避免宿主的文件监听失效。
+- 写入成功后记录日志：`已切换为峰时：3 个任务调整了 model_list`。
+- 插件写入后 10 秒内收到的 `model_config.toml` 热重载视为自身写入的回执，不再重复处理；其他外部改动会清空内部时段状态，下一次检查按当前时段重新应用。因此手动调整这几个任务的 `model_list` 顺序，可能在下一轮被插件覆盖。
 
 ## 配置
 
-插件加载后由 Runner 在插件目录生成 `config.toml`，可在 WebUI 修改：
+配置在 WebUI 插件配置面板中修改。保存后插件会重建时段与任务映射、清除 debug 静默窗口，并按 `enabled` 决定是否启动调度器、立即应用当前时段。
+
+### plugin
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | 关闭后不启动自动切换调度器，不会自动改写配置 |
+| `admin_users` | `[]` | 管理员列表，支持 `"123456789"` 或 `"qq:123456789"` 两种写法。匹配时只比较冒号后的 ID，平台前缀不参与校验；列表为空表示没有管理员 |
+| `llmlist_admin_only` | `false` | 为 `true` 时 `/llmlist` 仅管理员可用 |
+| `debug_pause_minutes` | `5` | `/switcher debug` 后暂停自动检测的分钟数。填 `0` 会按 5 处理，负数等于不暂停 |
+| `config_version` | `"1.2.0"` | WebUI 中隐藏且不可编辑；与插件内置版本不一致时只打印 INFO 提示，不做字段迁移 |
+
+### schedule
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `peak_periods` | `["09:00-12:00", "14:00-18:00"]` | 峰时时段列表，北京时间。格式非法的项会被忽略并记录 WARN |
+| `offpeak_periods` | `[]` | 谷时时段列表。留空时谷时 = 峰时之外的所有时间；填写后峰时完全由谷时段决定，`peak_periods` 不再参与判断 |
+| `exclude_weekdays` | `[6, 7]` | 排除峰时的星期，`1`=周一 … `7`=周日。命中的星期整天判为谷时；非法值会被忽略并记录 WARN |
+
+### task_mapping
+
+每个任务有两个独立字段：`<task>_peak_model` 与 `<task>_offpeak_model`，默认均为空字符串。
+
+| 任务键 | 中文名 |
+|--------|--------|
+| `replyer` | 回复 |
+| `planner` | 规划 |
+| `memory` | 记忆 |
+| `mid_memory` | 聊天回想 |
+| `utils` | 工具 |
+| `learner` | 学习 |
+| `expression_use` | 表达方式使用 |
+| `emoji` | 表情包 |
 
 ```toml
-[plugin]
-enabled = true                # 是否启用插件
-admin_users = []              # 管理员列表（用户ID 或 平台:用户ID，如 "123456789" 或 "qq:123456789"；/switcher debug 强制仅管理员可用）
-llmlist_admin_only = false    # 是否限制 /llmlist 仅管理员可用（默认关，所有人可用）
-debug_pause_minutes = 5       # /switcher debug 后暂停自动检测（安全网）的分钟数（默认 5）
-config_version = "1.2.0"      # 配置版本（与插件版本同步，UI 中隐藏）
-
-[schedule]
-peak_periods = ["09:00-12:00", "14:00-18:00"]   # 峰时时段（北京时间 HH:MM-HH:MM，支持跨天如 "22:00-02:00"）
-offpeak_periods = []                              # 谷时时段（可选；留空 = 峰时之外的所有时间）
-exclude_weekdays = [6, 7]                         # 排除峰时的星期（1=周一 ... 7=周日）
-
-[task_mapping]               # 每个任务的峰/谷模型为独立配置项（16 个）
-replyer_peak_model = "deepseek-v4-pro-think"             # 回复任务·峰时模型
-replyer_offpeak_model = "[OCG]deepseek-v4-flash-opencode go"   # 回复任务·谷时模型
-planner_peak_model = "deepseek-v4-pro-think"
-planner_offpeak_model = "[OCG]deepseek-v4-flash-opencode go"
-# memory / mid_memory / utils / learner / expression_use / emoji 同理
-# 全部留空 → 该任务不参与切换
-
-[model_file]
-model_config_path = ""        # 留空 = 从插件所在目录相对推导 <MaiBot根目录>/config/model_config.toml；填写 = 使用填写的路径（绝对或相对）
-backup = true                 # 修改前是否备份
-backup_keep = 10              # 备份保留份数
+[task_mapping]
+replyer_peak_model = "model-peak"
+replyer_offpeak_model = "model-offpeak"
+planner_peak_model = "model-peak"
+planner_offpeak_model = "model-offpeak"
+# 其余任务同理；峰/谷任一留空的任务不参与切换
 ```
 
-> `task_mapping` 下每个任务的峰时与谷时模型是**两个独立配置项**（`<task>_peak_model` 与 `<task>_offpeak_model`），WebUI 中分别显示、分别填写。`<任务>` 为 replyer / planner / memory / mid_memory / utils / learner / expression_use / emoji。
+字段值必须与 `model_config.toml` 的 `[[models]].name` 完全一致。未填写的任务不产生任何日志；填了但模型未定义或不在 `model_list` 中会记录 WARN。
 
-### 配置项一览
+### model_file
 
-| 配置项 | 说明 |
-|--------|------|
-| `plugin.enabled` | 是否启用插件（默认开）。关闭后停止峰谷切换调度 |
-| `plugin.admin_users` | 管理员列表（用户ID 或 `平台:用户ID`）。`/switcher debug` **强制仅管理员可用**；`/llmlist` 是否仅管理员由 `llmlist_admin_only` 决定 |
-| `plugin.llmlist_admin_only` | 是否限制 `/llmlist` 仅管理员可用（默认 `false`，所有人可用） |
-| `plugin.debug_pause_minutes` | 调用 `/switcher debug` 后暂停自动检测（安全网）的分钟数（默认 `5`）。静默期内再次 debug 重新计时、不叠加 |
-| `schedule.peak_periods` | 峰时时段列表，格式 `HH:MM-HH:MM`（半开区间 `[start, end)`），支持跨天（如 `"22:00-02:00"`） |
-| `schedule.offpeak_periods` | 谷时时段列表（可选）。留空时谷时 = 峰时之外的所有时间；填写后峰时 = 非排除日且不在谷时段内 |
-| `schedule.exclude_weekdays` | 排除峰时的星期数组，`1`=周一 … `7`=周日。默认 `[6, 7]`（周六日整天保持谷时） |
-| `task_mapping.<任务>_peak_model` | 对应任务峰时使用的模型名，必须与 `[[models]]` 的 `name` 完全一致；留空则跳过该任务 |
-| `task_mapping.<任务>_offpeak_model` | 对应任务谷时使用的模型名，同上 |
-| `model_file.model_config_path` | `model_config.toml` 路径。留空 = 从插件所在目录相对推导 `<MaiBot根目录>/config/model_config.toml`（插件目录移动后依然正确）；填写 = 使用填写的路径（绝对或相对，建议绝对路径） |
-| `model_file.backup` | 修改前备份到 `data/plugins/cateye_model_switcher/backup/`（默认开） |
-| `model_file.backup_keep` | 备份保留份数（默认 10） |
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `model_config_path` | `""` | 留空时按插件位置推导 `<插件目录>/../../config/model_config.toml`；填写时按填写的值使用，相对路径以进程当前工作目录为基准，建议填绝对路径 |
+| `backup` | `true` | 仅在本次确有任务变更时备份。文件名为 `model_config_YYYYmmdd_HHMMSS.toml`（北京时间），按修改时间倒序保留最近 `backup_keep` 份 |
+| `backup_keep` | `10` | 备份保留份数。填 `0` 会按 10 处理 |
 
-## 使用
+## 命令
 
-### ⚠️ 前置条件：选择策略须为「按顺序优先」
+### /llmlist
 
-本插件通过**提升到 `model_list` 首位**实现优先使用，因此被调整任务的 `selection_strategy` 必须为 **`"sequential"`**，否则提升顺序不会生效（如 `random` 会随机选择、`balance` 会负载均衡）。请在 `model_config.toml` 中设置：
+输入 `/llmlist`（注册名 `llmlist`）查看当前 `model_config.toml` 中各任务的模型列表。
 
-```toml
-[model_task_config.replyer]
-model_list = [ ... ]
-selection_strategy = "sequential"   # 必须：按配置顺序优先选择，首位模型优先使用
-```
+- 读取 `[model_task_config]`，分「动态调整任务」（8 个）与「固定任务」（`vlm` / `voice` / `embedding`）两组展示。
+- 每个任务显示模型数量，首位模型带「优先」徽章（固定任务显示「固定」），其余模型以标签列出；`model_list` 为空的显示「未配置」，任务表头注释会作为说明显示。
+- 生成 360px 宽的 PNG，优先作为单条合并转发消息发送；合并转发失败时回退为普通图片；解析或渲染失败时发送纯文本提示，渲染异常会记录日志。
+- 默认所有人可用；`plugin.llmlist_admin_only = true` 时仅 `admin_users` 可用，拒绝时提示「权限不足：/llmlist 已设为仅管理员可用。」
 
-> 插件不会自动改写 `selection_strategy`（避免干扰其他手动配置），请确保已按上述说明设置。
+### /switcher debug
 
-### 自动化切换
+输入 `/switcher debug`（注册名 `switcher_debug`），仅 `admin_users` 中的管理员可用；列表为空时无人可用。
 
-1. **启动时**：立即检查一次当前时段并应用。
-2. **运行中**：每 60 秒检查一次；**仅当时段发生变化（峰↔谷）** 才修改 `model_config.toml`。
-3. **热重载**：修改后 MaiBot FileWatcher 自动热重载，无需重启（插件订阅 `model` 配置热重载，可感知外部改动并刷新内部状态）。
+- 以插件记录的当前时段为准（尚未记录时按真实北京时间判断），取相反时段并立即应用；有任务变更时写入 `model_config.toml`。
+- 回复当前已切换为峰时还是谷时，并说明是否实际修改了文件。没有任务需要修改时（例如未配置该时段模型，或模型已在首位），回复「已强制切换为谷时，但 model_config.toml 无需修改（可能未配置该时段模型）」。
+- 调用后自动检测暂停 `plugin.debug_pause_minutes` 分钟，期间调度器不会按真实时段纠正。静默期内再次执行会重新计时、不叠加；保存插件配置会清除静默窗口；窗口结束后下一轮检查恢复按真实时段切换。
+- 非管理员调用时提示「权限不足：/switcher debug 仅管理员可用。」，不会翻转状态。
 
-### 防刷屏设计
-
-为避免「插件写文件 → 触发热重载 → 误判为外部改动 → 再写文件」的死循环导致日志刷屏，做了三重保护：
-
-- **仅时段变化才写**：同一时段内绝不重复写文件；
-- **字节级对比**：写入前将序列化结果与磁盘内容比对，内容一致时跳过写入；
-- **自己写入回执识别**：插件写入后记录标记；收到 `model` 热重载回调时，若在 **10 秒窗口内**则视为自己触发的回执，**静默处理、不重写**；窗口外或无标记的热重载才视为外部改动。
-
-因此每次时段切换**只写一次**文件、只触发一次热重载。插件**不打印任何热重载相关日志**——由框架原生处理。
-
-### 命令：`/llmlist`
-
-发送 `/llmlist` 查看所有任务的模型列表，以**图片**形式输出：
-
-- 读取 `[model_task_config]`，按**动态调整任务**（8 个）与**固定任务**（vlm / voice / embedding）分组展示；
-- 每个任务卡片标注模型数量，**首位模型带「优先」徽章**，其余模型以标签形式排列；
-- 使用 `ctx.render.html2png()` 渲染为 PNG，作为**单条消息用合并转发**发出（收敛为一条转发气泡）；合并转发不可用时回退为普通图片发送；
-- 渲染失败时回退为纯文本提示并记录日志；
-- **权限**：默认所有人可用；若配置 `plugin.llmlist_admin_only = true`，则仅 `plugin.admin_users` 中的管理员可用。
-
-### 命令：`/switcher debug`
-
-**仅管理员可用**（`plugin.admin_users`），用于测试峰谷切换代码是否正常：
-
-- 发送 `/switcher debug` 会**强制翻转**当前峰谷状态（峰 ↔ 谷）并立即应用（写入 `model_config.toml`）；
-- 返回提示当前已切换为**峰时**还是**谷时**，以及是否实际修改了配置；
-- **自动检测暂停**：每次调用后，调度器的自动检测（安全网）暂停 `plugin.debug_pause_minutes` 分钟（默认 5），期间**不会**按真实时段自动纠正；**静默期内再次执行 `/switcher debug` 会重新计时（不叠加）**；
-- 静默窗口结束后自动恢复自动检测，按真实北京时间纠正到正确状态（这也是一种「切回来」的方式）；
-- 若未配置任何管理员，或调用者不在 `admin_users` 中，命令被拒绝。
-
-### 日志示例
+## 日志示例
 
 ```
 [INFO] 峰谷模型切换插件已加载：模型配置文件 D:\MaiBot\config\model_config.toml，当前为谷时
+[INFO] 已备份原配置到 <插件数据目录>\backup\model_config_20260101_090000.toml
 [INFO] 已切换为峰时：3 个任务调整了 model_list
-[WARN] 任务 replyer 的峰时模型 "xxx" 不在其 model_list 中，跳过切换。
+[WARN] 任务 replyer 的峰时模型 "model-peak" 不在其 model_list 中，跳过切换。
 [WARN] model_config.toml 含 TOML 非法空值行（如 api_key = ），已临时补为 "" 后解析；建议在 WebUI 补全密钥
-[INFO] switcher debug：已强制切换为峰时（debug 测试）。自动检测已暂停 5 分钟，期间不会按真实时段纠正；再次执行 /switcher debug 可重新计时。
 ```
 
 ## 常见问题
 
-- **模型不在 `model_list` 中**：插件只做「提升到首位」，**不会**把模型添加进列表。请先在对应任务 `model_list` 中加入该模型。
-- **模型名不匹配**：`peak_model` / `offpeak_model` 必须与 `[[models]]` 下 `name` 字段**完全一致**（含空格、括号、大小写）。
-- **修改不生效**：检查 `model_file.model_config_path` 指向是否正确（留空即自动定位到 `<MaiBot根目录>/config/model_config.toml`，迁移 MaiBot 目录后无需改配置）；确认 `[[models]]` 与 `[model_task_config]` 非空；确认 `selection_strategy` 为 `"sequential"`。
-- **想临时停用**：WebUI 关闭 `plugin.enabled`，或把某任务 `peak_model`/`offpeak_model` 都留空。
-- **debug 后想立即切回真实状态**：再执行一次 `/switcher debug`（翻转回原状态），或等静默窗口结束后调度器自动按真实时段纠正；也可在 WebUI 保存一次插件配置触发热重载（会清除静默窗口）。
-- **静默窗口时长如何调整**：改 `plugin.debug_pause_minutes`（分钟），保存配置后热重载生效；静默期内再次 debug 会按新值重新计时。
-
-## 版本历史
-
-| 版本 | 变更 |
-|------|------|
-| 1.0.0 | 初始版本：峰谷定时切换、`/llmlist` 图片报表、TOML 格式保真、自动备份 |
-| 1.1.0 | 新增 `/switcher debug` 命令（仅管理员）；`admin_users` 插件自管管理员；`llmlist_admin_only` 开关；旧配置自动兼容 |
-| 1.1.1 | `/switcher debug` 新增静默窗口：调用后自动检测（安全网）暂停 `debug_pause_minutes` 分钟（默认 5，可配置），静默期内再次调用重新计时、不叠加 |
-| 1.1.2 | `model_file.model_config_path` 默认改为空，不再把绝对路径固化进配置；路径解析改为从插件所在目录出发的相对推导（`<插件目录>/../../config/model_config.toml`），修复 MaiBot 目录迁移后旧路径失效的问题。升级后请在 WebUI 将 `model_config_path` 清空以启用相对解析 |
-| 1.1.3 | 为全部配置项补充/完善中文标签与悬停提示，完善配置节说明；功能与行为不变 |
-| 1.2.0 | 适配 MaiBot 1.3.0 / 新版插件市场规范：全部配置项与配置分组补充英文 i18n（WebUI 界面语言为英文时显示英文标签）；manifest 更新描述与兼容区间声明（`sdk.min_version` 2.8.0）、新增 `changelog` 字段；移除"不上传插件市场"声明，按新版插件市场要求完善 README |
+- **到点没有切换**：先确认 `plugin.enabled` 为开；再看日志里是否有对应任务的 WARN。某任务峰/谷模型只填了一个、模型名与 `[[models]].name` 不一致、模型不在该任务 `model_list` 中，都会导致该任务被跳过。
+- **切换了但模型没变**：确认对应任务的 `selection_strategy` 为 `"sequential"`。插件只调整 `model_list` 顺序、不改该字段，其他策略下首位模型不保证被使用。
+- **填写了 `offpeak_periods` 后峰时时段失效**：这是既定行为。谷时列表非空时，峰时 = 非排除日且不在任一谷时段内，`peak_periods` 不再参与判断。
+- **周末一直是谷时**：`exclude_weekdays` 默认为 `[6, 7]`，命中时整天判为谷时。需要周末也执行峰时，把它改为空列表或只保留需要的星期。
+- **日志提示找不到 `model_config.toml`**：`model_file.model_config_path` 留空时的推导路径是 `<插件目录>/../../config/model_config.toml`。插件不在 `<MaiBot根目录>/plugins/` 下时，请填写绝对路径；`/llmlist` 此时也会提示解析失败。
+- **手动改的顺序被改回**：插件在外部热重载后会按当前时段重新应用；需要临时手动调整时，先关闭 `plugin.enabled`。
+- **如何恢复备份**：先关闭 `plugin.enabled`，把日志中打印的备份文件复制回 `model_config.toml`，再按需重新启用。
+- **debug 后一直没自动纠正**：静默窗口内本就不会自动纠正；等待窗口结束、再执行一次 `/switcher debug` 翻转回来，或在 WebUI 保存一次插件配置以清除静默窗口。
+- **命令提示权限不足**：`/switcher debug` 始终要求管理员；`/llmlist` 仅在 `llmlist_admin_only = true` 时要求管理员。确认 `admin_users` 非空，且填写的 ID 与调用者 ID 一致（`平台:ID` 写法只比较冒号后的 ID）。
+- **TOML 空值警告**：配置文件里存在 `api_key = ` 这类没有值的行。插件会临时补成 `""` 以保证解析通过，写回时保留该形态；请尽快在 WebUI 补全对应密钥。
+- **报表日期与时段状态不在同一天**：`/llmlist` 标题日期取宿主系统本地时间，峰谷判断固定用 UTC+8；服务器时区不是东八区时可能出现差异。
 
 ## 文件结构
 
 ```
 cateye_model_switcher/
-├── _manifest.json      # 插件清单（Manifest v2）
-├── plugin.py           # SDK 插件入口（生命周期、调度器、配置模型、/llmlist 与 /switcher debug 命令；依赖 maibot_sdk）
-├── switcher_core.py    # 核心逻辑（时段解析、TOML 读写、任务切换、任务清单定义；纯 Python，不依赖 SDK，可独立测试）
-├── report_renderer.py  # 任务模型列表 HTML 报表渲染（/llmlist 用；不依赖 SDK）
+├── _manifest.json      # Manifest v2 清单
+├── plugin.py           # 插件入口：配置模型、调度器、命令
+├── switcher_core.py    # 时段判定、TOML 读写、任务切换、备份
+├── report_renderer.py  # /llmlist 报表 HTML
 ├── __init__.py
+├── CHANGELOG.md
 ├── README.md
 └── LICENSE             # MIT
 ```
 
-## 开发与测试
+## 许可证与仓库
 
-本插件为标准 **MaiBot SDK 插件**（基于 `maibot-plugin-sdk`，使用 `MaiBotPlugin` / `PluginConfigBase` / `Field` / `Command` 等 SDK 组件；配置模型、生命周期、命令注册均由 SDK 提供）。
+MIT License，作者 cateye。
 
-- **`switcher_core.py`**：核心逻辑（时段解析、TOML 读写、任务切换、任务清单定义）**不依赖 SDK**，是纯 Python 模块；
-- **`report_renderer.py`**：HTML 报表渲染，同样不依赖 SDK；
-- **`plugin.py`**：SDK 插件入口，依赖 `maibot_sdk`（由 MaiBot Runner 提供），本地开发需先安装 SDK 才能导入。
-
-```bash
-pip install maibot-plugin-sdk tomlkit   # 本地开发依赖
-```
+- 仓库：<https://github.com/cateyemizuki/cateye_model_switcher>
+- 问题反馈：<https://github.com/cateyemizuki/cateye_model_switcher/issues>
+- 更新记录：[CHANGELOG.md](CHANGELOG.md)
